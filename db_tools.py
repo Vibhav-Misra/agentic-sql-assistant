@@ -1,4 +1,5 @@
 import sqlite3
+import pandas as pd
 from langchain_core.tools import tool
 
 # Point to the database we created in Phase 1
@@ -48,22 +49,22 @@ def get_schema(table_names: str) -> str:
 @tool
 def execute_query(query: str) -> str:
     """Executes a SQL SELECT statement and returns the results or an error message."""
-    # Safety guard: Prevent the LLM from running DROP, DELETE, or UPDATE
     if not query.strip().upper().startswith("SELECT"):
         return "Error: For database safety, only SELECT queries are allowed."
     
     try:
         conn = sqlite3.connect(DB_PATH)
-        cursor = conn.cursor()
-        cursor.execute(query)
-        results = cursor.fetchall()
+        # Use Pandas to execute the query and fetch data with column headers
+        df = pd.read_sql_query(query, conn)
         conn.close()
         
-        # Return the results as a string so the LLM can read them
-        return str(results)
+        # Save the raw data to a temporary CSV file for the Streamlit frontend
+        df.to_csv("results.csv", index=False)
+        
+        # Return a string representation so the LLM can read the data and synthesize an answer
+        return df.to_string(index=False)
+        
     except Exception as e:
-        # If the LLM writes bad SQL, we catch the error and return it to the LLM
-        # so it can read the error and try again!
         return f"SQL Execution Error: {e}"
 
 # --- Test block ---
