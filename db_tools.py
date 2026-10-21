@@ -72,4 +72,20 @@ if __name__ == "__main__":
     print("Available Tables:", list_tables.invoke(""))
     print("\nSchema for 'users' and 'orders':\n", get_schema.invoke("customers, orders"))
     print("Test Query Result:", execute_query.invoke("SELECT count(*) FROM products;"))
-    
+
+@tool
+def generate_chart(code: str) -> str:
+    """Executes Python code to create a chart. 
+    Rules:
+    1. Use matplotlib.pyplot as plt.
+    2. The dataset must be hardcoded within the code based on your SQL results.
+    3. You MUST save the plot using plt.savefig('output_chart.png').
+    4. NEVER use plt.show().
+    """
+    try:
+        # Execute the code in an isolated dictionary namespace
+        namespace = {}
+        exec(code, namespace)
+        return "Chart generated successfully and saved to output_chart.png."
+    except Exception as e:
+        return f"Python execution error: {e}"

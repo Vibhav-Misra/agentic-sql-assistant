@@ -1,93 +1,67 @@
 import os
-from typing import Annotated
+from typing import Annotated, Literal
 from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import SystemMessage, HumanMessage
 from langgraph.graph import StateGraph, START, END
 from langgraph.graph.message import add_messages
-from langgraph.prebuilt import ToolNode, tools_condition
+from langgraph.prebuilt import ToolNode
+from langgraph.checkpoint.memory import MemorySaver
 from typing_extensions import TypedDict
 
-# Import the database tools we built in Phase 2
-from db_tools import list_tables, get_schema, execute_query
+from db_tools import list_tables, get_schema, execute_query, generate_chart
 
-# Load the API key from the .env file
 load_dotenv()
 
-# 1. Define the Tools and the LLM
-tools = [list_tables, get_schema, execute_query]
-# We use temperature=0 because we want deterministic, factual SQL generation, not creative writing.
-llm = ChatOpenAI(model="gpt-4o", temperature=0)
-llm_with_tools = llm.bind_tools(tools)
+# 1. Split tools into Safe and Sensitive
+safe_tools = [list_tables, get_schema, generate_chart]
+sensitive_tools = [execute_query]
+all_tools = safe_tools + sensitive_tools
 
-# 2. Define the State
-# The State tracks the conversation history. 'add_messages' ensures new 
-# messages are appended to the list rather than overwriting it.
+llm = ChatOpenAI(model="gpt-4o", temperature=0)
+llm_with_tools = llm.bind_tools(all_tools)
+
 class AgentState(TypedDict):
     messages: Annotated[list, add_messages]
 
-# 3. Define the LLM Node
 def chatbot(state: AgentState):
-    """The main brain of the agent."""
     sys_msg = SystemMessage(content='''You are an expert SQL data analyst. 
-    When asked a question, follow these exact steps:
-    1. Use list_tables to see available tables.
-    2. Use get_schema to understand the structure of the relevant tables.
-    3. Write and execute a SQL query using execute_query.
-    4. If the query fails, read the error message, rewrite the SQL, and try again.
-    5. Finally, answer the user's question in plain English based on the data.
+    1. Use list_tables and get_schema to understand the data.
+    2. Write a SQL query and use execute_query.
+    3. If asked for a chart, use generate_chart.
+    4. Provide the final answer in plain English.
     ''')
-    
-    # Prepend the system instructions to the conversation history
     messages = [sys_msg] + state["messages"]
-    
-    # Call the LLM
     response = llm_with_tools.invoke(messages)
     return {"messages": [response]}
 
-# 4. Build the Graph
+# 2. Custom Router to distinguish between safe and sensitive tools
+def route_tools(state: AgentState) -> Literal["safe_tools", "sensitive_tools", "__end__"]:
+    messages = state["messages"]
+    last_message = messages[-1]
+    
+    if not getattr(last_message, "tool_calls", None):
+        return END
+    
+    # If the LLM asked to execute SQL, route to the sensitive node
+    if any(tool_call["name"] == "execute_query" for tool_call in last_message.tool_calls):
+        return "sensitive_tools"
+    
+    return "safe_tools"
+
 graph_builder = StateGraph(AgentState)
-
-# Add the nodes (the actors)
 graph_builder.add_node("agent", chatbot)
-graph_builder.add_node("tools", ToolNode(tools)) # ToolNode runs the python functions
+graph_builder.add_node("safe_tools", ToolNode(safe_tools))
+graph_builder.add_node("sensitive_tools", ToolNode(sensitive_tools))
 
-# Add the edges (the routing logic)
 graph_builder.add_edge(START, "agent")
+graph_builder.add_conditional_edges("agent", route_tools)
+graph_builder.add_edge("safe_tools", "agent")
+graph_builder.add_edge("sensitive_tools", "agent")
 
-# tools_condition checks the LLM's output: 
-# If it asked to use a tool, route to "tools". If it wrote a normal text response, route to END.
-graph_builder.add_conditional_edges("agent", tools_condition)
-
-# After the tools finish running, always route back to the agent to evaluate the results
-graph_builder.add_edge("tools", "agent")
-
-# Compile the final graph into an executable application
-app = graph_builder.compile()
-
-# --- Test block ---
-if __name__ == "__main__":
-    print("Agent is ready! Ask a question (type 'quit' to exit).")
-    while True:
-        user_input = input("\nUser: ")
-        if user_input.lower() in ["quit", "exit", "q"]:
-            break
-            
-        # Stream the agent's thought process
-        events = app.stream(
-            {"messages": [HumanMessage(content=user_input)]}, 
-            stream_mode="values"
-        )
-        
-        for event in events:
-            if "messages" in event:
-                latest_msg = event["messages"][-1]
-                
-                # If the agent is using a tool, print a status update
-                if latest_msg.type == "ai" and latest_msg.tool_calls:
-                    tool_names = [t['name'] for t in latest_msg.tool_calls]
-                    print(f"   [Agent is thinking... using tools: {', '.join(tool_names)}]")
-                
-                # If the agent responds with final text, print it
-                elif latest_msg.type == "ai" and not latest_msg.tool_calls:
-                    print(f"\nAgent: {latest_msg.content}")
+# 3. Add Memory and the Breakpoint
+memory = MemorySaver()
+app = graph_builder.compile(
+    checkpointer=memory,
+    interrupt_before=["sensitive_tools"] # Graph pauses BEFORE executing this node
+)
